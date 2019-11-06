@@ -2,9 +2,9 @@ package duramap
 
 import (
 	"bytes"
+	"sync"
 
 	bolt "github.com/etcd-io/bbolt"
-	mutable "github.com/notduncansmith/mutable"
 	mp "github.com/vmihailenco/msgpack"
 )
 
@@ -13,7 +13,7 @@ type GenericMap = map[string]interface{}
 
 // Duramap is a map of strings to ambiguous data structures, which is protected by a Read/Write mutex and backed by a bbolt database
 type Duramap struct {
-	mut  *mutable.RW
+	mut  *sync.RWMutex
 	db   *bolt.DB
 	d    *mp.Decoder
 	bz   []byte
@@ -37,7 +37,7 @@ func NewDuramap(path, name string) (*Duramap, error) {
 		return nil, err
 	}
 
-	mut := mutable.NewRW("<<Duramap " + name + ": " + path + " >>")
+	mut := &sync.RWMutex{}
 	bz := []byte{}
 	d := mp.NewDecoder(bytes.NewBuffer(bz))
 
@@ -59,10 +59,10 @@ func (dm *Duramap) Load() error {
 			if err != nil {
 				return err
 			}
-			dm.mut.DoWithRWLock(func() {
-				b.Put([]byte(dm.Name), bz)
-				dm.unsafeSet(m, bz)
-			})
+			defer dm.mut.Unlock()
+			dm.mut.Lock()
+			b.Put([]byte(dm.Name), bz)
+			dm.unsafeSet(m, bz)
 		}
 
 		mperr := mp.Unmarshal(bz, &m)
@@ -70,9 +70,9 @@ func (dm *Duramap) Load() error {
 			return mperr
 		}
 
-		dm.mut.DoWithRWLock(func() {
-			dm.unsafeSetMap(m)
-		})
+		defer dm.mut.Unlock()
+		dm.mut.Lock()
+		dm.unsafeSetMap(m)
 
 		return nil
 	})
@@ -80,69 +80,67 @@ func (dm *Duramap) Load() error {
 
 // UpdateMap is like `DoWithMap` but the result of `f` is re-saved afterwards
 func (dm *Duramap) UpdateMap(f func(m GenericMap) GenericMap) error {
-	var err error
-	dm.mut.DoWithRWLock(func() {
-		newM := f(dm.m)
-		err = dm.unsafeStoreMap(newM)
-		if err == nil {
-			dm.unsafeSetMap(newM)
-		}
-	})
-	return err
+	defer dm.mut.Unlock()
+	dm.mut.Lock()
+	newM := f(dm.m)
+	err := dm.unsafeStoreMap(newM)
+	if err != nil {
+		return err
+	}
+	dm.unsafeSetMap(newM)
+	return nil
 }
 
 // WithMap returns the result of calling `f` with the internal map
 func (dm *Duramap) WithMap(f func(m GenericMap) interface{}) interface{} {
-	return dm.mut.WithRLock(func() interface{} {
-		return f(dm.m)
-	})
+	defer dm.mut.RUnlock()
+	dm.mut.RLock()
+	return f(dm.m)
 }
 
 // DoWithMap is like `WithMap` but does not return a result
 func (dm *Duramap) DoWithMap(f func(m GenericMap)) {
-	dm.mut.DoWithRLock(func() {
-		f(dm.m)
-	})
+	defer dm.mut.RUnlock()
+	dm.mut.RLock()
+	f(dm.m)
 }
 
 // UpdateBytes is like `UpdateMap` but with bytes
 func (dm *Duramap) UpdateBytes(f func(bz []byte) []byte) error {
-	var err error
-	dm.mut.DoWithRWLock(func() {
-		newBz := f(dm.bz)
-		err = dm.unsafeStoreBytes(newBz)
-		if err == nil {
-			dm.unsafeSetBytes(newBz)
-		}
-	})
+	defer dm.mut.Unlock()
+	dm.mut.Lock()
+	newBz := f(dm.bz)
+	err := dm.unsafeStoreBytes(newBz)
+	if err == nil {
+		dm.unsafeSetBytes(newBz)
+	}
 	return err
 }
 
 // WithBytes returns the result of calling `f` with the internal bytes
 func (dm *Duramap) WithBytes(f func(bz []byte) interface{}) interface{} {
-	return dm.mut.WithRLock(func() interface{} {
-		return f(dm.bz)
-	})
+	defer dm.mut.RUnlock()
+	dm.mut.RLock()
+	return f(dm.bz)
 }
 
 // DoWithBytes is like `WithBytes` but does not return a result
 func (dm *Duramap) DoWithBytes(f func(bz []byte)) {
-	dm.mut.DoWithRLock(func() {
-		f(dm.bz)
-	})
+	defer dm.mut.RUnlock()
+	dm.mut.RLock()
+	f(dm.bz)
 }
 
 // DoWithQuery extracts values matching a path `q` from the map and calls `f` with the results
 func (dm *Duramap) DoWithQuery(q string, f func([]interface{})) error {
-	var results []interface{}
-	var err error
-	dm.mut.DoWithRLock(func() {
-		results, err = dm.d.Query(q)
-		if err == nil {
-			f(results)
-		}
-	})
-	return err
+	defer dm.mut.RUnlock()
+	dm.mut.RLock()
+	results, err := dm.d.Query(q)
+	if err != nil {
+		return err
+	}
+	f(results)
+	return nil
 }
 
 func (dm *Duramap) unsafeSet(m GenericMap, bz []byte) {
