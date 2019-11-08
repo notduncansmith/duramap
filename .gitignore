@@ -1,3 +1,2 @@
 fixtures/*
 !fixtures/.gitkeep
-!fixtures/bench_*
