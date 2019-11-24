@@ -3,6 +3,7 @@ package duramap
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -19,51 +20,75 @@ const str64 = "abc4567890123456789012345678901234567890123456789012345678901234"
 var str128 = str64 + str64
 var str256 = str128 + str128
 
-func TestRoundtrip(t *testing.T) {
-	dm, err := NewDuramap("./fixtures/test.db", "test")
+func withDM(name string, t *testing.T, fn func(dm *Duramap)) {
+	os.Remove("./fixtures/" + name + ".db")
+	defer os.Remove("./fixtures/" + name + ".db")
+
+	dm, err := NewDuramap("./fixtures/"+name+".db", name)
 	defer dm.Close()
 
 	if err != nil {
 		t.Errorf("Should be able to open database: %v", err)
-		return
 	}
 
-	if err = dm.Load(); err != nil {
+	if err := dm.Load(); err != nil {
 		t.Errorf("Should be able to load map: %v", err)
 		return
 	}
 
-	err = dm.UpdateMap(func(m GenericMap) GenericMap {
-		m[foo] = bar
-		return m
-	})
+	fn(dm)
+}
+
+func updateMap(t *testing.T, dm *Duramap, fn func(m GenericMap) GenericMap) {
+	err := dm.UpdateMap(fn)
 
 	if err != nil {
 		t.Errorf("Should be able to save value: %v", err)
 	}
+}
 
-	foo := dm.WithMap(func(m GenericMap) interface{} {
-		return m[foo]
-	}).(string)
+func expectMap(t *testing.T, dm *Duramap, gm GenericMap) {
+	m := dm.WithMap(func(m GenericMap) interface{} {
+		if m == nil {
+			t.Errorf("Expected map %v, got nil", gm)
+		}
+		return m
+	}).(GenericMap)
 
-	if foo != bar {
-		t.Error("Should be able to read saved value")
-		return
+	for k, v := range gm {
+		if m[k] != v {
+			t.Errorf("Expected m[%v] == %v, got %v", k, gm[k], v)
+		}
 	}
 
-	dm.Truncate()
-	dm.DoWithMap(func(m GenericMap) {
-		if m[foo] != nil {
-			t.Error("Should not be able to read saved value after .Truncate()")
+	for k := range m {
+		if gm[k] == nil {
+			t.Errorf("Unexpected key %v", k)
 		}
+	}
+}
+
+func TestRoundtrip(t *testing.T) {
+	withDM("roundtrip", t, func(dm *Duramap) {
+		updateMap(t, dm, func(m GenericMap) GenericMap {
+			m[foo] = bar
+			return m
+		})
+		expectMap(t, dm, GenericMap{"foo": "bar"})
+		dm.Truncate()
+		expectMap(t, dm, GenericMap{})
 	})
 }
 
 func TestConcurrentAccess(t *testing.T) {
 	wg := sync.WaitGroup{}
-	access := func(i int) {
-		defer wg.Done()
-		wg.Add(1)
+	mut := mutable.NewRW("wg")
+
+	access := func(i int, w *sync.WaitGroup) {
+		defer mut.DoWithRWLock(func() {
+			w.Done()
+		})
+
 		dm, err := NewDuramap("./fixtures/concurrent_access.db", "concurrent")
 		if err != nil {
 			t.Errorf("Should be able to open database: %v", err)
@@ -80,9 +105,9 @@ func TestConcurrentAccess(t *testing.T) {
 				return m
 			})
 			if err != nil {
-				t.Errorf("Unable to save value: %v", err)
+				t.Errorf("Should be able to save value: %v", err)
 			}
-			time.Sleep(time.Millisecond * time.Duration(rand.Intn(100)))
+			time.Sleep(time.Millisecond * time.Duration(rand.Intn(10)))
 		}
 		for n := 0; n < 10; n++ {
 			dm.DoWithMap(func(m GenericMap) {
@@ -95,9 +120,30 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 
 	for m := 0; m < 12; m++ {
-		go access(m)
+		wg.Add(1)
+		go access(m, &wg)
 	}
+
 	wg.Wait()
+}
+
+func TestLoadEmpty(t *testing.T) {
+	withDM("load_empty", t, func(dm *Duramap) {
+		expectMap(t, dm, GenericMap{})
+	})
+}
+
+func TestLoadRepeated(t *testing.T) {
+	_, err := NewDuramap("./fixtures/repeated.db", "repeated")
+	if err != nil {
+		t.Errorf("Should be able to open database: %v", err)
+	}
+
+	_, err = NewDuramap("./fixtures/repeated.db", "repeated")
+
+	if err != nil {
+		t.Errorf("Should be able to open database: %v", err)
+	}
 }
 
 func BenchmarkReadsDuramap(b *testing.B) {
