@@ -1,0 +1,12 @@
+dist: xenial
+
+language: go
+
+go:
+- 1.13.x
+
+install: make build
+script: make test
+
+after_success:
+  - bash <(curl -s https://codecov.io/bash)

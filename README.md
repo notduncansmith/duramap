@@ -1,6 +1,6 @@
 # Duramap
 
-[![GoDoc](https://godoc.org/github.com/notduncansmith/duramap?status.svg)](https://godoc.org/github.com/notduncansmith/duramap)
+[![GoDoc](https://godoc.org/github.com/notduncansmith/duramap?status.svg)](https://godoc.org/github.com/notduncansmith/duramap) [![Build Status](https://travis-ci.com/notduncansmith/duramap.svg?branch=master)](https://travis-ci.com/notduncansmith/duramap) [![codecov](https://codecov.io/gh/notduncansmith/duramap/branch/master/graph/badge.svg)](https://codecov.io/gh/notduncansmith/duramap)
 
 Duramap wraps the speed of a `map[string]interface{}` with the safety of a [`sync.RWMutex`](https://golang.org/pkg/sync/#RWMutex) and the durability of [`bbolt`](https://github.com/etcd-io/bbolt). It is intended to be a reliable thread-safe store of mutable, frequently-read, seldom-written K/V data (such as configuration that may be accessed on the hot path of an application).
 
@@ -76,12 +76,6 @@ BenchmarkWritesMutableMap/mutable-12     	22621276	        52.1 ns/op
 
 ## License
 
-[The MIT License](https://opensource.org/licenses/MIT):
+Released under [The MIT License](https://opensource.org/licenses/MIT) (see `LICENSE.txt`).
 
 Copyright 2019 Duncan Smith
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
