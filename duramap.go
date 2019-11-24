@@ -2,6 +2,7 @@ package duramap
 
 import (
 	"bytes"
+	"errors"
 	"sync"
 
 	"github.com/notduncansmith/mutable"
@@ -55,42 +56,30 @@ func NewDuramap(path, name string) (*Duramap, error) {
 
 // Load reads the stored Duramap value and sets it
 func (dm *Duramap) Load() error {
-	dm.mut.RLock()
-	if dm.m != nil {
-		dm.mut.RUnlock()
-		return nil
-	}
-	dm.mut.RUnlock()
-
 	return dm.db.Update(func(tx *bolt.Tx) error {
 		m := GenericMap{}
-		b, err := tx.CreateBucketIfNotExists(bucketName)
-		if err != nil {
-			return err
-		}
+		b, _ := tx.CreateBucketIfNotExists(bucketName)
 
 		bz := b.Get([]byte(dm.Name))
-		if bz == nil {
-			bz, err = mp.Marshal(m)
-			if err != nil {
-				return err
-			}
-			defer dm.mut.Unlock()
+		if bz == nil || len(bz) == 0 {
+			bz, _ = mp.Marshal(m)
 			dm.mut.Lock()
-			err = b.Put([]byte(dm.Name), bz)
+			err := b.Put([]byte(dm.Name), bz)
 			if err != nil {
+				dm.mut.Unlock()
 				return err
 			}
 			dm.unsafeSet(m, bz)
+			dm.mut.Unlock()
 		}
 
 		mperr := mp.Unmarshal(bz, &m)
 		if mperr != nil {
-			return mperr
+			return errors.New("Cannot unmarshal map: " + mperr.Error())
 		}
 
-		defer dm.mut.Unlock()
 		dm.mut.Lock()
+		defer dm.mut.Unlock()
 		dm.unsafeSet(m, bz)
 
 		return nil
@@ -121,31 +110,6 @@ func (dm *Duramap) DoWithMap(f func(m GenericMap)) {
 	f(dm.m)
 }
 
-// UpdateBytes is like `UpdateMap` but with bytes
-func (dm *Duramap) UpdateBytes(f func(bz []byte) []byte) error {
-	defer dm.mut.Unlock()
-	dm.mut.Lock()
-	if err := dm.unsafeSetBytes(f(dm.bz)); err != nil {
-		return err
-	}
-
-	return dm.unsafeStoreBytes()
-}
-
-// WithBytes returns the result of calling `f` with the internal bytes
-func (dm *Duramap) WithBytes(f func(bz []byte) interface{}) interface{} {
-	defer dm.mut.RUnlock()
-	dm.mut.RLock()
-	return f(dm.bz)
-}
-
-// DoWithBytes is like `WithBytes` but does not return a result
-func (dm *Duramap) DoWithBytes(f func(bz []byte)) {
-	defer dm.mut.RUnlock()
-	dm.mut.RLock()
-	f(dm.bz)
-}
-
 // Close will close the connection to the database and remove the Duramap from the list of Duramaps
 func (dm *Duramap) Close() error {
 	err := dmsRW.WithRWLock(func() interface{} {
@@ -168,18 +132,6 @@ func (dm *Duramap) Truncate() error {
 	})
 }
 
-// DoWithQuery extracts values matching a path `q` from the map and calls `f` with the results
-func (dm *Duramap) DoWithQuery(q string, f func([]interface{})) error {
-	defer dm.mut.RUnlock()
-	dm.mut.RLock()
-	results, err := dm.d.Query(q)
-	if err != nil {
-		return err
-	}
-	f(results)
-	return nil
-}
-
 func (dm *Duramap) unsafeSet(m GenericMap, bz []byte) {
 	dm.bz = bz
 	dm.m = m
@@ -196,35 +148,10 @@ func (dm *Duramap) unsafeSetMap(m GenericMap) error {
 	return nil
 }
 
-func (dm *Duramap) unsafeSetBytes(bz []byte) (err error) {
-	dm.m = GenericMap{}
-	err = mp.Unmarshal(bz, &dm.m)
-
-	if err != nil {
-		return err
-	}
-
-	dm.unsafeSet(dm.m, bz)
-
-	return nil
-}
-
-func (dm *Duramap) unsafeStoreMap() error {
-	var err error
-	dm.bz, err = mp.Marshal(dm.m)
-	if err != nil {
-		return err
-	}
-	return dm.unsafeStoreBytes()
-}
-
 func (dm *Duramap) unsafeStoreBytes() error {
 	return dm.db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists(bucketName)
-		if err != nil {
-			return err
-		}
-		b.Put([]byte(dm.Name), dm.bz)
+		b, _ := tx.CreateBucketIfNotExists(bucketName)
+		err := b.Put([]byte(dm.Name), dm.bz)
 		return err
 	})
 }
