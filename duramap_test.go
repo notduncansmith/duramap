@@ -82,12 +82,9 @@ func TestRoundtrip(t *testing.T) {
 
 func TestConcurrentAccess(t *testing.T) {
 	wg := sync.WaitGroup{}
-	mut := mutable.NewRW("wg")
 
 	access := func(i int, w *sync.WaitGroup) {
-		defer mut.DoWithRWLock(func() {
-			w.Done()
-		})
+		w.Done()
 
 		dm, err := NewDuramap("./fixtures/concurrent_access.db", "concurrent")
 		if err != nil {
