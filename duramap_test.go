@@ -98,7 +98,7 @@ func TestConcurrentAccess(t *testing.T) {
 			t.Errorf("Should be able to load map: %v", err)
 			return
 		}
-		for n := 0; n < 10; n++ {
+		for n := 0; n < 5; n++ {
 			err := dm.UpdateMap(func(m GenericMap) GenericMap {
 				k := fmt.Sprintf("%v-%v", i, n)
 				m[k] = n
@@ -109,7 +109,7 @@ func TestConcurrentAccess(t *testing.T) {
 			}
 			time.Sleep(time.Millisecond * time.Duration(rand.Intn(10)))
 		}
-		for n := 0; n < 10; n++ {
+		for n := 0; n < 5; n++ {
 			dm.DoWithMap(func(m GenericMap) {
 				k := fmt.Sprintf("%v-%v", i, n)
 				if m[k] != n {
@@ -119,7 +119,7 @@ func TestConcurrentAccess(t *testing.T) {
 		}
 	}
 
-	for m := 0; m < 12; m++ {
+	for m := 0; m < 6; m++ {
 		wg.Add(1)
 		go access(m, &wg)
 	}
