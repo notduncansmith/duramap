@@ -1,8 +1,6 @@
 package duramap
 
 import (
-	"bytes"
-	"errors"
 	"sync"
 
 	"github.com/notduncansmith/mutable"
@@ -13,41 +11,71 @@ import (
 // GenericMap is a map of strings to empty interfaces
 type GenericMap = map[string]interface{}
 
+// Tx is a transaction that operates on a Duramap. It has a reference to the internal map.
+type Tx struct {
+	M      *GenericMap
+	writes GenericMap
+}
+
+// Get returns the latest value either written in the Tx or stored in the map
+func (tx *Tx) Get(k string) interface{} {
+	written := tx.writes[k]
+	if written != nil {
+		return written
+	}
+	return (*tx.M)[k]
+}
+
+// Set writes a new value in the Tx
+func (tx *Tx) Set(k string, v interface{}) {
+	tx.writes[k] = v
+}
+
 // Duramap is a map of strings to ambiguous data structures, which is protected by a Read/Write mutex and backed by a bbolt database
 type Duramap struct {
 	mut  *sync.RWMutex
 	db   *bolt.DB
-	d    *mp.Decoder
-	bz   []byte
 	m    GenericMap
 	Path string
 	Name string
 }
 
+var dbs = map[string]*bolt.DB{}
+var dbsRW = mutable.NewRW("dbs")
+
 var dms = map[string]*Duramap{}
 var dmsRW = mutable.NewRW("dms")
-var bucketName = []byte("dms")
 
 // NewDuramap returns a new Duramap backed by a bbolt database located at `path`
 func NewDuramap(path, name string) (*Duramap, error) {
 	dm := dmsRW.WithRLock(func() interface{} {
-		return unsafeGetDM(name)
+		return unsafeGetDM(path + ":" + name)
 	}).(*Duramap)
 
 	if dm != nil {
 		return dm, nil
 	}
 
-	db, err := bolt.Open(path, 0600, nil)
+	var err error
+	var db *bolt.DB
+	dbsRW.DoWithRWLock(func() {
+		if dbs[path] != nil {
+			db = dbs[path]
+			return
+		}
+		db, err = bolt.Open(path, 0600, nil)
+		if err == nil {
+			dbs[path] = db
+		}
+	})
+
 	if err != nil {
 		return nil, err
 	}
 
 	mut := &sync.RWMutex{}
-	bz := []byte{}
-	d := mp.NewDecoder(bytes.NewBuffer(bz))
 
-	dm = &Duramap{mut, db, d, bz, GenericMap{}, path, name}
+	dm = &Duramap{mut, db, GenericMap{}, path, name}
 	dmsRW.DoWithRWLock(func() {
 		unsafeAddDM(dm)
 	})
@@ -56,44 +84,70 @@ func NewDuramap(path, name string) (*Duramap, error) {
 
 // Load reads the stored Duramap value and sets it
 func (dm *Duramap) Load() error {
-	return dm.db.Update(func(tx *bolt.Tx) error {
-		m := GenericMap{}
-		b, _ := tx.CreateBucketIfNotExists(bucketName)
+	dm.db.Update(func(tx *bolt.Tx) error {
+		tx.CreateBucketIfNotExists([]byte(dm.Name))
+		return nil
+	})
 
-		bz := b.Get([]byte(dm.Name))
-		if bz == nil || len(bz) == 0 {
-			bz, _ = mp.Marshal(m)
-			dm.mut.Lock()
-			err := b.Put([]byte(dm.Name), bz)
-			if err != nil {
-				dm.mut.Unlock()
+	return dm.db.View(func(tx *bolt.Tx) error {
+		m := GenericMap{}
+		b := tx.Bucket([]byte(dm.Name))
+		c := b.Cursor()
+
+		for k, bz := c.First(); k != nil; k, bz = c.Next() {
+			v := map[string]interface{}{}
+			if bz == nil || len(bz) == 0 {
+				continue
+			}
+			if err := mp.Unmarshal(bz, &v); err != nil {
 				return err
 			}
-			dm.unsafeSet(m, bz)
-			dm.mut.Unlock()
-		}
-
-		mperr := mp.Unmarshal(bz, &m)
-		if mperr != nil {
-			return errors.New("Cannot unmarshal map: " + mperr.Error())
+			m[string(k)] = v["."]
 		}
 
 		dm.mut.Lock()
 		defer dm.mut.Unlock()
-		dm.unsafeSet(m, bz)
+		dm.m = m
 
 		return nil
 	})
 }
 
 // UpdateMap is like `DoWithMap` but the result of `f` is re-saved afterwards
-func (dm *Duramap) UpdateMap(f func(m GenericMap) GenericMap) error {
+func (dm *Duramap) UpdateMap(f func(tx *Tx) error) error {
 	defer dm.mut.Unlock()
 	dm.mut.Lock()
-	if err := dm.unsafeSetMap(f(dm.m)); err != nil {
+	tx := dm.tx()
+	if err := f(tx); err != nil {
 		return err
 	}
-	return dm.unsafeStoreBytes()
+	bzWrites := map[string][]byte{}
+	for k, v := range tx.writes {
+		bz, err := mp.Marshal(map[string]interface{}{".": v})
+		if err != nil {
+			return err
+		}
+		bzWrites[k] = bz
+	}
+	err := dm.db.Update(func(btx *bolt.Tx) error {
+		for k, v := range bzWrites {
+			b, _ := btx.CreateBucketIfNotExists([]byte(dm.Name))
+			if err := b.Put([]byte(k), v); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	for k, v := range tx.writes {
+		dm.m[k] = v
+	}
+
+	return nil
 }
 
 // WithMap returns the result of calling `f` with the internal map
@@ -110,62 +164,36 @@ func (dm *Duramap) DoWithMap(f func(m GenericMap)) {
 	f(dm.m)
 }
 
-// Close will close the connection to the database and remove the Duramap from the list of Duramaps
-func (dm *Duramap) Close() error {
-	err := dmsRW.WithRWLock(func() interface{} {
-		if err := dm.db.Close(); err != nil {
-			return err
-		}
-		unsafeRemoveDM(dm.Name)
-		return nil
-	})
-	if err != nil {
-		return err.(error)
-	}
-	return nil
-}
-
 // Truncate will reset the contents of the Duramap to an empty GenericMap
 func (dm *Duramap) Truncate() error {
-	return dm.UpdateMap(func(m GenericMap) GenericMap {
-		return GenericMap{}
+	dm.mut.Lock()
+	defer dm.mut.Unlock()
+	err := dm.db.Update(func(tx *bolt.Tx) error {
+		err := tx.DeleteBucket([]byte(dm.Name))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucket([]byte(dm.Name))
+		return err
 	})
-}
-
-func (dm *Duramap) unsafeSet(m GenericMap, bz []byte) {
-	dm.bz = bz
-	dm.m = m
-	dm.d = mp.NewDecoder(bytes.NewBuffer(dm.bz))
-}
-
-func (dm *Duramap) unsafeSetMap(m GenericMap) error {
-	bz, err := mp.Marshal(m)
-
 	if err != nil {
 		return err
 	}
-	dm.unsafeSet(m, bz)
+	dm.m = GenericMap{}
 	return nil
 }
 
-func (dm *Duramap) unsafeStoreBytes() error {
-	return dm.db.Update(func(tx *bolt.Tx) error {
-		b, _ := tx.CreateBucketIfNotExists(bucketName)
-		err := b.Put([]byte(dm.Name), dm.bz)
-		return err
-	})
+func (dm *Duramap) tx() *Tx {
+	return &Tx{&dm.m, GenericMap{}}
 }
 
 func unsafeAddDM(dm *Duramap) {
-	if dms[dm.Name] == nil {
-		dms[dm.Name] = dm
+	k := dm.Path + ":" + dm.Name
+	if dms[k] == nil {
+		dms[k] = dm
 	}
 }
 
-func unsafeGetDM(name string) *Duramap {
-	return dms[name]
-}
-
-func unsafeRemoveDM(name string) {
-	dms[name] = nil
+func unsafeGetDM(k string) *Duramap {
+	return dms[k]
 }

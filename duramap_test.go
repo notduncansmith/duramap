@@ -25,7 +25,6 @@ func withDM(name string, t *testing.T, fn func(dm *Duramap)) {
 	defer os.Remove("./fixtures/" + name + ".db")
 
 	dm, err := NewDuramap("./fixtures/"+name+".db", name)
-	defer dm.Close()
 
 	if err != nil {
 		t.Errorf("Should be able to open database: %v", err)
@@ -39,7 +38,7 @@ func withDM(name string, t *testing.T, fn func(dm *Duramap)) {
 	fn(dm)
 }
 
-func updateMap(t *testing.T, dm *Duramap, fn func(m GenericMap) GenericMap) {
+func updateMap(t *testing.T, dm *Duramap, fn func(tx *Tx) error) {
 	err := dm.UpdateMap(fn)
 
 	if err != nil {
@@ -61,18 +60,29 @@ func expectMap(t *testing.T, dm *Duramap, gm GenericMap) {
 		}
 	}
 
-	for k := range m {
-		if gm[k] == nil {
-			t.Errorf("Unexpected key %v", k)
+	dm.DoWithMap(func(m GenericMap) {
+		for k := range m {
+			if gm[k] == nil {
+				t.Errorf("Unexpected key %v", k)
+			}
 		}
-	}
+	})
 }
 
 func TestRoundtrip(t *testing.T) {
 	withDM("roundtrip", t, func(dm *Duramap) {
-		updateMap(t, dm, func(m GenericMap) GenericMap {
-			m[foo] = bar
-			return m
+		updateMap(t, dm, func(tx *Tx) error {
+			tx.Set(foo, bar)
+			if tx.Get(foo) != bar {
+				t.Error("Should be able to read saved value")
+			}
+			return nil
+		})
+		updateMap(t, dm, func(tx *Tx) error {
+			if tx.Get(foo) != bar {
+				t.Error("Should be able to read saved value")
+			}
+			return nil
 		})
 		expectMap(t, dm, GenericMap{"foo": "bar"})
 		dm.Truncate()
@@ -84,22 +94,21 @@ func TestConcurrentAccess(t *testing.T) {
 	wg := sync.WaitGroup{}
 
 	access := func(i int, w *sync.WaitGroup) {
-		w.Done()
+		defer w.Done()
 
 		dm, err := NewDuramap("./fixtures/concurrent_access.db", "concurrent")
 		if err != nil {
 			t.Errorf("Should be able to open database: %v", err)
 		}
-		defer dm.Close()
 		if err = dm.Load(); err != nil {
 			t.Errorf("Should be able to load map: %v", err)
 			return
 		}
 		for n := 0; n < 5; n++ {
-			err := dm.UpdateMap(func(m GenericMap) GenericMap {
+			err := dm.UpdateMap(func(tx *Tx) error {
 				k := fmt.Sprintf("%v-%v", i, n)
-				m[k] = n
-				return m
+				tx.Set(k, n)
+				return nil
 			})
 			if err != nil {
 				t.Errorf("Should be able to save value: %v", err)
@@ -165,12 +174,12 @@ func benchmarkReadsDuramap(label string, mapContents interface{}, b *testing.B) 
 		b.Errorf("Should be able to open database: %v", err)
 	}
 
-	err = dm.UpdateMap(func(m GenericMap) GenericMap {
-		m[foo] = bar
+	err = dm.UpdateMap(func(tx *Tx) error {
+		tx.Set(foo, bar)
 		for i := 0; i < 10000; i++ {
-			m["thing-"+fmt.Sprintf("%v", i)] = mapContents
+			tx.Set("thing-"+fmt.Sprintf("%v", i), mapContents)
 		}
-		return m
+		return nil
 	})
 
 	if err != nil {
@@ -196,12 +205,12 @@ func benchmarkWritesDuramap(label string, mapContents interface{}, b *testing.B)
 		b.Errorf("Should be able to open database: %v", err)
 	}
 
-	err = dm.UpdateMap(func(m GenericMap) GenericMap {
-		m[foo] = bar
+	err = dm.UpdateMap(func(tx *Tx) error {
+		tx.Set(foo, bar)
 		for i := 0; i < 10000; i++ {
-			m["thing-"+fmt.Sprintf("%v", i)] = mapContents
+			tx.Set("thing-"+fmt.Sprintf("%v", i), mapContents)
 		}
-		return m
+		return nil
 	})
 
 	if err != nil {
@@ -210,12 +219,12 @@ func benchmarkWritesDuramap(label string, mapContents interface{}, b *testing.B)
 
 	b.Run(label, func(b *testing.B) {
 		for n := 0; n < b.N; n++ {
-			err = dm.UpdateMap(func(m GenericMap) GenericMap {
-				m[foo] = baz
-				if m[foo] != baz {
+			err = dm.UpdateMap(func(tx *Tx) error {
+				tx.Set(foo, baz)
+				if tx.Get(foo) != baz {
 					b.Error("Should be able to read saved value")
 				}
-				return m
+				return nil
 			})
 
 			if err != nil {
@@ -227,6 +236,7 @@ func benchmarkWritesDuramap(label string, mapContents interface{}, b *testing.B)
 
 func BenchmarkReadsBbolt(b *testing.B) {
 	db, err := bolt.Open("./fixtures/bench_bbolt.db", 0600, nil)
+	bucketName := []byte("bbolt")
 	defer db.Close()
 	if err != nil {
 		b.Errorf("Should be able to open database: %v", err)
@@ -266,6 +276,7 @@ func BenchmarkReadsBbolt(b *testing.B) {
 
 func BenchmarkWritesBbolt(b *testing.B) {
 	db, err := bolt.Open("./fixtures/bench_bbolt.db", 0600, nil)
+	bucketName := []byte("bbolt")
 	defer db.Close()
 	if err != nil {
 		b.Errorf("Should be able to open database: %v", err)
