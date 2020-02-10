@@ -1,7 +1,12 @@
 package duramap
 
 import (
+	"crypto/rand"
+	"errors"
+	"io"
 	"sync"
+
+	"golang.org/x/crypto/nacl/secretbox"
 
 	"github.com/notduncansmith/mutable"
 	mp "github.com/vmihailenco/msgpack"
@@ -10,6 +15,9 @@ import (
 
 // GenericMap is a map of strings to empty interfaces
 type GenericMap = map[string]interface{}
+
+// EncryptionSecret is a 32-byte secret key used to encrypt data with the Secretbox construction
+type EncryptionSecret = *[32]byte
 
 // Tx is a transaction that operates on a Duramap. It has a reference to the internal map.
 type Tx struct {
@@ -33,11 +41,12 @@ func (tx *Tx) Set(k string, v interface{}) {
 
 // Duramap is a map of strings to ambiguous data structures, which is protected by a Read/Write mutex and backed by a bbolt database
 type Duramap struct {
-	mut  *sync.RWMutex
-	db   *bolt.DB
-	m    GenericMap
-	Path string
-	Name string
+	mut              *sync.RWMutex
+	db               *bolt.DB
+	encryptionSecret EncryptionSecret
+	m                GenericMap
+	Path             string
+	Name             string
 }
 
 var dbs = map[string]*bolt.DB{}
@@ -47,7 +56,7 @@ var dms = map[string]*Duramap{}
 var dmsRW = mutable.NewRW("dms")
 
 // NewDuramap returns a new Duramap backed by a bbolt database located at `path`
-func NewDuramap(path, name string) (*Duramap, error) {
+func NewDuramap(path, name string, secret EncryptionSecret) (*Duramap, error) {
 	dm := dmsRW.WithRLock(func() interface{} {
 		return unsafeGetDM(path + ":" + name)
 	}).(*Duramap)
@@ -75,7 +84,7 @@ func NewDuramap(path, name string) (*Duramap, error) {
 
 	mut := &sync.RWMutex{}
 
-	dm = &Duramap{mut, db, GenericMap{}, path, name}
+	dm = &Duramap{mut, db, secret, GenericMap{}, path, name}
 	dmsRW.DoWithRWLock(func() {
 		unsafeAddDM(dm)
 	})
@@ -84,10 +93,12 @@ func NewDuramap(path, name string) (*Duramap, error) {
 
 // Load reads the stored Duramap value and sets it
 func (dm *Duramap) Load() error {
-	dm.db.Update(func(tx *bolt.Tx) error {
-		tx.CreateBucketIfNotExists([]byte(dm.Name))
-		return nil
-	})
+	if err := dm.db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(dm.Name))
+		return err
+	}); err != nil {
+		return err
+	}
 
 	return dm.db.View(func(tx *bolt.Tx) error {
 		m := GenericMap{}
@@ -98,6 +109,13 @@ func (dm *Duramap) Load() error {
 			v := map[string]interface{}{}
 			if bz == nil || len(bz) == 0 {
 				continue
+			}
+			if dm.encryptionSecret != nil {
+				clearbz, err := decrypt(dm.encryptionSecret, bz)
+				if err != nil {
+					return err
+				}
+				bz = clearbz
 			}
 			if err := mp.Unmarshal(bz, &v); err != nil {
 				return err
@@ -127,12 +145,20 @@ func (dm *Duramap) UpdateMap(f func(tx *Tx) error) error {
 		if err != nil {
 			return err
 		}
-		bzWrites[k] = bz
+		if dm.encryptionSecret == nil {
+			bzWrites[k] = bz
+			continue
+		}
+		cypherbz, err := encrypt(dm.encryptionSecret, bz)
+		if err != nil {
+			return err
+		}
+		bzWrites[k] = cypherbz
 	}
 	err := dm.db.Update(func(btx *bolt.Tx) error {
-		for k, v := range bzWrites {
-			b, _ := btx.CreateBucketIfNotExists([]byte(dm.Name))
-			if err := b.Put([]byte(k), v); err != nil {
+		b, _ := btx.CreateBucketIfNotExists([]byte(dm.Name))
+		for k, vbz := range bzWrites {
+			if err := b.Put([]byte(k), vbz); err != nil {
 				return err
 			}
 		}
@@ -196,4 +222,28 @@ func unsafeAddDM(dm *Duramap) {
 
 func unsafeGetDM(k string) *Duramap {
 	return dms[k]
+}
+
+func encrypt(secret EncryptionSecret, clearbz []byte) ([]byte, error) {
+	var nonce [24]byte
+
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return nil, err
+	}
+
+	encrypted := secretbox.Seal(nil, clearbz, &nonce, secret)
+	cypherbz := make([]byte, len(encrypted)+24)
+	copy(cypherbz[:24], nonce[:])
+	copy(cypherbz[24:], encrypted)
+	return cypherbz, nil
+}
+
+func decrypt(secret EncryptionSecret, cypherbz []byte) ([]byte, error) {
+	var nonce [24]byte
+	copy(nonce[:], cypherbz[:24])
+	clearbz, ok := secretbox.Open(nil, cypherbz[24:], &nonce, secret)
+	if !ok {
+		return nil, errors.New("Unable to decrypt")
+	}
+	return clearbz, nil
 }

@@ -1,7 +1,9 @@
 package duramap
 
 import (
+	crand "crypto/rand"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"sync"
@@ -20,11 +22,22 @@ const str64 = "abc4567890123456789012345678901234567890123456789012345678901234"
 var str128 = str64 + str64
 var str256 = str128 + str128
 
-func withDM(name string, t *testing.T, fn func(dm *Duramap)) {
+func withDM(name string, t *testing.T, encrypted bool, fn func(dm *Duramap)) {
 	os.Remove("./fixtures/" + name + ".db")
 	defer os.Remove("./fixtures/" + name + ".db")
+	key, err := generateEncryptionSecret()
 
-	dm, err := NewDuramap("./fixtures/"+name+".db", name)
+	if !encrypted {
+		key = nil
+		err = nil
+	}
+
+	if err != nil {
+		t.Errorf("Unable to generate encryption key: %v", err)
+		return
+	}
+
+	dm, err := NewDuramap("./fixtures/"+name+".db", name, key)
 
 	if err != nil {
 		t.Errorf("Should be able to open database: %v", err)
@@ -70,7 +83,28 @@ func expectMap(t *testing.T, dm *Duramap, gm GenericMap) {
 }
 
 func TestRoundtrip(t *testing.T) {
-	withDM("roundtrip", t, func(dm *Duramap) {
+	withDM("roundtrip", t, false, func(dm *Duramap) {
+		updateMap(t, dm, func(tx *Tx) error {
+			tx.Set(foo, bar)
+			if tx.Get(foo) != bar {
+				t.Errorf("Should be able to read saved value %v %v", tx, bar)
+			}
+			return nil
+		})
+		updateMap(t, dm, func(tx *Tx) error {
+			if tx.Get(foo) != bar {
+				t.Errorf("Should be able to read saved value %v %v", *(tx.M), tx.Get(foo))
+			}
+			return nil
+		})
+		expectMap(t, dm, GenericMap{foo: bar})
+		dm.Truncate()
+		expectMap(t, dm, GenericMap{})
+	})
+}
+
+func TestRoundtripEncrypted(t *testing.T) {
+	withDM("roundtrip_encrypted", t, true, func(dm *Duramap) {
 		updateMap(t, dm, func(tx *Tx) error {
 			tx.Set(foo, bar)
 			if tx.Get(foo) != bar {
@@ -84,7 +118,7 @@ func TestRoundtrip(t *testing.T) {
 			}
 			return nil
 		})
-		expectMap(t, dm, GenericMap{"foo": "bar"})
+		expectMap(t, dm, GenericMap{foo: bar})
 		dm.Truncate()
 		expectMap(t, dm, GenericMap{})
 	})
@@ -92,19 +126,25 @@ func TestRoundtrip(t *testing.T) {
 
 func TestConcurrentAccess(t *testing.T) {
 	wg := sync.WaitGroup{}
+	key, err := generateEncryptionSecret()
+	if err != nil {
+		t.Errorf("Unable to generate encryption secret: %v", err)
+	}
+	defer os.Remove("./fixtures/concurrent_access.db")
 
 	access := func(i int, w *sync.WaitGroup) {
 		defer w.Done()
 
-		dm, err := NewDuramap("./fixtures/concurrent_access.db", "concurrent")
+		dm, err := NewDuramap("./fixtures/concurrent_access.db", "concurrent", key)
 		if err != nil {
 			t.Errorf("Should be able to open database: %v", err)
+			return
 		}
 		if err = dm.Load(); err != nil {
 			t.Errorf("Should be able to load map: %v", err)
 			return
 		}
-		for n := 0; n < 5; n++ {
+		for n := 0; n < 9; n++ {
 			err := dm.UpdateMap(func(tx *Tx) error {
 				k := fmt.Sprintf("%v-%v", i, n)
 				tx.Set(k, n)
@@ -112,10 +152,11 @@ func TestConcurrentAccess(t *testing.T) {
 			})
 			if err != nil {
 				t.Errorf("Should be able to save value: %v", err)
+				return
 			}
 			time.Sleep(time.Millisecond * time.Duration(rand.Intn(10)))
 		}
-		for n := 0; n < 5; n++ {
+		for n := 0; n < 9; n++ {
 			dm.DoWithMap(func(m GenericMap) {
 				k := fmt.Sprintf("%v-%v", i, n)
 				if m[k] != n {
@@ -125,7 +166,7 @@ func TestConcurrentAccess(t *testing.T) {
 		}
 	}
 
-	for m := 0; m < 6; m++ {
+	for m := 0; m < 3; m++ {
 		wg.Add(1)
 		go access(m, &wg)
 	}
@@ -134,18 +175,19 @@ func TestConcurrentAccess(t *testing.T) {
 }
 
 func TestLoadEmpty(t *testing.T) {
-	withDM("load_empty", t, func(dm *Duramap) {
+	withDM("load_empty", t, true, func(dm *Duramap) {
 		expectMap(t, dm, GenericMap{})
 	})
 }
 
 func TestLoadRepeated(t *testing.T) {
-	_, err := NewDuramap("./fixtures/repeated.db", "repeated")
+	defer os.Remove("./fixtures/repeated.db")
+	_, err := NewDuramap("./fixtures/repeated.db", "repeated", nil)
 	if err != nil {
 		t.Errorf("Should be able to open database: %v", err)
 	}
 
-	_, err = NewDuramap("./fixtures/repeated.db", "repeated")
+	_, err = NewDuramap("./fixtures/repeated.db", "repeated", nil)
 
 	if err != nil {
 		t.Errorf("Should be able to open database: %v", err)
@@ -167,7 +209,7 @@ func BenchmarkWritesDuramap(b *testing.B) {
 }
 
 func benchmarkReadsDuramap(label string, mapContents interface{}, b *testing.B) {
-	dm, err := NewDuramap("./fixtures/bench_duramap_reads.db", "test_reads")
+	dm, err := NewDuramap("./fixtures/bench_duramap_reads.db", "test_reads", nil)
 	defer dm.Truncate()
 
 	if err != nil {
@@ -198,7 +240,7 @@ func benchmarkReadsDuramap(label string, mapContents interface{}, b *testing.B) 
 }
 
 func benchmarkWritesDuramap(label string, mapContents interface{}, b *testing.B) {
-	dm, err := NewDuramap("./fixtures/bench_duramap_writes.db", "test_writes")
+	dm, err := NewDuramap("./fixtures/bench_duramap_writes.db", "test_writes", nil)
 	defer dm.Truncate()
 
 	if err != nil {
@@ -368,4 +410,12 @@ func BenchmarkWritesMutableMap(b *testing.B) {
 			})
 		}
 	})
+}
+
+func generateEncryptionSecret() (EncryptionSecret, error) {
+	var secretKey [32]byte
+	if _, err := io.ReadFull(crand.Reader, secretKey[:]); err != nil {
+		return nil, err
+	}
+	return &secretKey, nil
 }
